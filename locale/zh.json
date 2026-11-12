@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "TokenShare 限流",
+    "description": "给第三方 provider 路由做出门节流与异常重放：每分钟请求上限、上游 5xx 后等待重发，两个参数在设置页用滑块调节。"
+  }
+}

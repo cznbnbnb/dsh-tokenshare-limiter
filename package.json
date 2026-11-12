@@ -1,0 +1,55 @@
+{
+  "name": "dsh-tokenshare-limiter",
+  "version": "1.0.0",
+  "description": "TokenShare provider 请求节流：每分钟上限、上游 5xx 后等待重放，设置页滑块调节 · Per-minute throttle and retry-after-wait for the TokenShare provider route",
+  "type": "module",
+  "main": "index.js",
+  "license": "MIT",
+  "engines": {
+    "dsh": ">=0.2.0"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "tokenshare",
+    "rate-limit",
+    "throttle",
+    "retry"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cznbnbnb/dsh-tokenshare-limiter.git"
+  },
+  "homepage": "https://github.com/cznbnbnb/dsh-tokenshare-limiter#readme",
+  "bugs": {
+    "url": "https://github.com/cznbnbnb/dsh-tokenshare-limiter/issues"
+  },
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "client.js",
+    "cordis.patch.yml",
+    "locale/*.json",
+    "icon.svg",
+    "README.md",
+    "README.en.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    }
+  }
+}

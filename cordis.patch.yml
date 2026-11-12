@@ -1,0 +1,8 @@
+- insert:
+    - id: tokenshare-limiter
+      name: dsh-tokenshare-limiter
+      config:
+        enabled: true
+        providers: tokenshare
+        perMinute: 14
+        retryWaitMinutes: 5

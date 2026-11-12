@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "TokenShare throttle",
+    "description": "Throttles third-party provider request routes to a per-window limit, retries after upstream 5xx, and exposes both numbers as sliders in Settings."
+  }
+}
