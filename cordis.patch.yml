@@ -6,3 +6,6 @@
         providers: tokenshare
         perMinute: 14
         retryWaitMinutes: 5
+        # 按 surface 与即将准入的消息合计限制图片；只追加 image/offload，
+        # 不覆盖 llm-pi-ai 的模型、接口、凭据或兼容配置。
+        maxImages: 4

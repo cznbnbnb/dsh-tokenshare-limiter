@@ -2,7 +2,7 @@
 
 [中文](README.md) | English
 
-Outgoing rate limiting and failure recovery for the TokenShare provider route in DeepSeek Harness (`dsh`): stay under a per-minute floor so the platform never bans the account, and turn an upstream 503 into a short wait instead of a dead turn.
+Outgoing rate limiting, failure recovery, and image-limit recovery for the TokenShare provider route in DeepSeek Harness (`dsh`): stay under the request-rate ceiling and prevent an upstream 503 or a fifth prompt image from ending the turn.
 
 > **No credentials involved.** The plugin never reads, stores, or forwards an API key. TokenShare authentication stays exactly where DSH already keeps it.
 
@@ -10,10 +10,11 @@ Outgoing rate limiting and failure recovery for the TokenShare provider route in
 
 TokenShare enforces a hard per-account request rate; exceeding it triggers a temporary ban measured in hours. Its upstream also returns 503 intermittently, and a single failure ends the whole turn.
 
-The plugin hooks the `llm/stream` waterfall and does two things:
+The plugin hooks `llm/stream` and `agent/request-error` to do three things:
 
 1. **Outgoing throttle** — at most N requests per sliding window. Requests beyond the budget queue until the window rolls over instead of failing.
 2. **Failure replay** — on upstream 429/5xx, wait M minutes and retry, instead of handing the error to the conversation.
+3. **Image-limit recovery** — offload the oldest retained images during `agent/pre-step`, counting both the existing surface and newly admitted messages against a four-image prompt budget. An explicit image-count 400 from a custom route produces the same durable `image/offload` decision and a retry.
 
 ## Install
 
@@ -40,16 +41,16 @@ dsh plugin --profile <profile> remove dsh-tokenshare-limiter
 
 ## Use
 
-It works on install with safe defaults: **14 requests per minute**, **5 minutes between retries**.
+The defaults are 14 requests per minute and 5 minutes between retries for temporary upstream failures.
 
-Settings → **TokenShare 限流** shows:
+Open **Settings → TokenShare 限流**.
 
-- A status pill: running / paused (click to toggle)
-- Two sliders — per-minute cap (1–60) and retry wait in minutes (1–60). Dragging saves immediately and applies at once
-- Counters: current window usage, total requests, queue waits, replay attempts, failures
-- A recent-events log: every queue and every replay is recorded, so you can confirm it is actually working
+- Use the switch at the top right to enable or pause the limiter.
+- The usage panel shows the current window and cumulative counts. While requests are waiting, it shows the reason, the expected resume time in Beijing time and the queue length.
+- Under rate rules, drag a slider or enter a number to change the request cap or the retry delay (1–60 each). Changes save automatically. A failed save can be retried in place.
+- Filter recent activity to warnings and errors, or expand a failure to read the details.
 
-Slider values live in `~/.dsh/settings/tokenshare-limiter.json`. Changing them needs no restart and survives disabling/enabling the plugin.
+Settings take effect on save and are stored in `~/.dsh/settings/tokenshare-limiter.json`.
 
 ## Configuration
 
@@ -65,6 +66,7 @@ Defaults can be set in the profile's `cordis.patch.yml`:
     retryWaitMinutes: 5
     windowSeconds: 60
     maxRetries: 6
+    maxImages: 4
 ```
 
 | Field | Default | Meaning |
@@ -75,6 +77,7 @@ Defaults can be set in the profile's `cordis.patch.yml`:
 | `retryWaitMinutes` | `5` | Wait before replaying a failed request |
 | `windowSeconds` | `60` | Window length |
 | `maxRetries` | `6` | Replay budget per request; `0` disables replay |
+| `maxImages` | `4` | Images per prompt (1–50), counting existing history and the new batch |
 
 Slider values take precedence; fields absent from the saved file fall back to this configuration.
 
@@ -82,27 +85,30 @@ Slider values take precedence; fields absent from the saved file fall back to th
 
 **The cap means "at most N per minute."** The first N requests go out immediately; request N+1 queues until the window rolls over (about a minute). Lower N to be more conservative.
 
-**Only requests that emitted no content are replayed.** A stream that already produced tokens is never replayed — restarting it would duplicate text in the reply. Those failures propagate to the conversation as usual.
+An attempt that emitted only zero-token usage can be retried. Partial text, reasoning, tool output or nonzero usage propagates the failure to the host.
 
-**Replays are bounded.** After six consecutive failures (about half an hour) the error goes back to the caller instead of hanging forever.
+Each request has a default budget of six retries.
 
-**The plugin degrades to pass-through on its own errors.** It sits on every model request, so any internal exception is logged and the request continues untouched.
+**Images are preserved, not copied or deleted.** Offload marks the oldest retained input occurrences as `offloaded`; DSH then sends placeholder text and an available read-only path while preserving the original attachments and session records. Only HTTP 400 failures (or `INVALID_REQUEST` without a status) that explicitly state a per-prompt image limit enter this recovery path.
+
+All sessions on a TokenShare route wait until the deadline reported by `account_blacklisted`. A timestamp without an offset uses Beijing time. A later deadline extends the wait. Pending requests can be cancelled and resume in queue order subject to the rate cap.
 
 ## Privacy
 
 - Contains no API key, token, or account identifier, and never reads them.
 - Sends nothing to any external server. The only HTTP endpoint is a local `127.0.0.1` settings API that accepts loopback origins only.
-- Reads exactly two fields of `llm/stream` — `provider` and `signal`. It never reads, modifies, or logs request content.
-- Persists three numbers: `perMinute`, `retryWaitMinutes`, `enabled`.
+- Reads exactly two fields of `llm/stream` — `provider` and `signal` — and never rewrites its frozen request messages.
+- Only after an explicit image-limit 400 on a matching provider does it inspect image block types and offload markers. It never reads image bytes or logs prompt text; recovery writes DSH's native `image/offload` event to the existing session.
+- The settings file stores rate settings. Harness instances using the same data directory share cooldown deadlines in `settings/tokenshare-limiter-cooldowns`. Expired records are removed automatically.
 
 ## Compatibility
 
-Built and verified on DSH `0.2.2-rc.2`. Declares `engines.dsh: >=0.2.0`; older hosts may lack the `settings.section` slot, in which case the settings page does not appear but throttling still works.
+Verified on DSH desktop `0.2.2-rc.2` and `0.2.3-alpha.2`. Declares `engines.dsh: >=0.2.0`; older hosts may lack the `settings.section` slot, in which case the settings page does not appear but throttling still works.
 
 ## Known limitations
 
 - The full "wait five minutes then replay" path has not been exercised against a real 503 (it needs the upstream to fail at that moment). Every queue and replay is recorded on the settings page, so it can be verified in practice.
-- Throttle state is in-process; the window starts empty after a DSH restart.
+- The rate window starts empty after a DSH restart. Account cooldown deadlines persist across restarts.
 - Throttling happens at `llm/stream` only, not inside provider adapters' other network calls such as model discovery.
 
 ## License

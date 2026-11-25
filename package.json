@@ -1,7 +1,7 @@
 {
   "name": "dsh-tokenshare-limiter",
-  "version": "1.0.0",
-  "description": "TokenShare provider 请求节流：每分钟上限、上游 5xx 后等待重放，设置页滑块调节 · Per-minute throttle and retry-after-wait for the TokenShare provider route",
+  "version": "1.2.0",
+  "description": "TokenShare 请求节流、异常重放与单提示词图片上限恢复；保留原始附件并复用 DSH 图片转存。",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
@@ -26,12 +26,14 @@
   },
   "exports": {
     ".": "./index.js",
+    "./image-limit": "./image-limit.js",
     "./client": "./client.js",
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
   "files": [
     "index.js",
+    "image-limit.js",
     "client.js",
     "cordis.patch.yml",
     "locale/*.json",
@@ -40,6 +42,9 @@
     "README.en.md",
     "LICENSE"
   ],
+  "scripts": {
+    "test": "node --test tests/*.test.js"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
