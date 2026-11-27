@@ -125,6 +125,7 @@ test('生产监听器：发送前留出新图名额，必要时在 400 后转存
     const listeners = {}
     const ctx = {
       on(name, listener) { listeners[name] = listener; return () => {} },
+      effect(setup) { setup() },
       inject() {},
       get() { return undefined },
     }

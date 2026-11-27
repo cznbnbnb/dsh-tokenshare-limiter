@@ -275,8 +275,8 @@ window.__ModuleLoader__.load({
       const limit = status?.window.limit ?? perMinute
       const recent = status?.recent ?? []
       const visible = filter === 'warn' ? recent.filter(item => item.level === 'warn' || item.level === 'error') : recent
-      const displayWait = waiting && (enabled || status.queued || waiting.kind === 'retry')
-      const mode = loadError ? 'error' : !settings || !enabled ? 'idle' : displayWait ? 'wait' : 'ok'
+      const displayWait = waiting && (enabled || status.queued || waiting.kind === 'account' || waiting.kind === 'retry')
+      const mode = loadError ? 'error' : displayWait ? 'wait' : settings && enabled ? 'ok' : 'idle'
       const modes = { error: '状态读取失败', idle: settings ? '已暂停' : '正在读取', wait: '等待发送', ok: '正常放行' }
       const resumeAt = waiting && new Date(waiting.until ?? syncAt + waiting.remainingMs)
       const remaining = resumeAt ? Math.max(0, resumeAt.getTime() - Date.now()) : 0
@@ -305,11 +305,11 @@ window.__ModuleLoader__.load({
           loadError, h('button', { type: 'button', className: 'tl-action', onClick: pull }, '重新读取')),
         h('section', { className: 'tl-window', 'aria-label': '请求窗口' },
           h('div', { className: 'tl-line' },
-            h('h3', null, settings ? '近 ' + settings.windowSeconds + ' 秒用量' : '请求窗口'),
+            h('h3', null, settings ? settings.windowSeconds + ' 秒请求窗口' : '请求窗口'),
             h('span', { className: 'tl-state', 'data-mode': mode }, modes[mode])),
           displayWait && h('div', { className: 'tl-notice' },
             h('div', { className: 'tl-resume' },
-              h('b', null, !enabled ? '已排队请求仍在等待' : waiting.kind === 'account' ? '账号限流' : waiting.kind === 'rate' ? '窗口已满' : '等待重试'),
+              h('b', null, waiting.kind === 'account' ? '账号限流' : waiting.kind === 'rate' ? '等待发送间隔' : '等待重试'),
               h('time', { className: 'tl-deadline', dateTime: resumeAt.toISOString() },
                 resumeAt.toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }))),
             h('p', null, resumeAt.toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' }) +
@@ -333,7 +333,7 @@ window.__ModuleLoader__.load({
           h('div', { className: 'tl-rule-grid' },
             h(Slider, {
               id: 'tl-request-cap', label: '窗口请求上限', value: perMinute, unit: '次', disabled: !settings,
-              hint: '超出上限的请求按顺序排队。',
+              hint: status?.window.spacingMs ? '各会话共用额度，当前放行间隔约 ' + (status.window.spacingMs / 1000).toFixed(2) + ' 秒。' : '超出上限的请求按顺序排队。',
               onChange: value => { setPerMinute(value); schedule({ perMinute: value }) },
             }),
             h(Slider, {

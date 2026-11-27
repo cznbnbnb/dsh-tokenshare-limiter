@@ -16,6 +16,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { offloadImagesForFailure, offloadImagesToBudget, pendingImageCount } from './image-limit.js'
 
 export {
@@ -34,6 +35,7 @@ const API_PREFIX = '/dsh-tokenshare-limiter/api'
 /** 滑块值的落点：~/.dsh/settings/tokenshare-limiter.json */
 const SETTINGS_FILE = join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'settings', 'tokenshare-limiter.json')
 const COOLDOWN_DIR = join(dirname(SETTINGS_FILE), 'tokenshare-limiter-cooldowns')
+const REQUEST_DB = join(COOLDOWN_DIR, 'requests.sqlite')
 
 /** 这些 HTTP 状态视为「上游临时不可用」，值得等一会儿重放。 */
 const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504, 529])
@@ -158,7 +160,10 @@ function isTerminalErrorChunk(chunk) {
 // TokenShare uses Beijing time for timestamps without an explicit offset.
 export function accountCooldownDeadline(failure, now, fallbackMs) {
   const message = failure.message ?? ''
-  if (failure.code !== 'account_blacklisted' && !/"code"\s*:\s*"account_blacklisted"/i.test(message)) return 0
+  const limited = failure.status === 429 || /^429\b/.test(message)
+    || /^(?:account_blacklisted|rate_limit(?:ed|_exceeded|_error)?|too_many_requests)$/i.test(failure.code ?? '')
+    || /"code"\s*:\s*"account_blacklisted"/i.test(message)
+  if (!limited) return 0
   const match = /try again after\s+(\d{4}-\d\d-\d\d)[ T](\d\d:\d\d:\d\d(?:\.\d+)?)(Z|[+-]\d\d:\d\d)?/i.exec(message)
   const deadline = match ? Date.parse(match[1] + 'T' + match[2] + (match[3] ?? '+08:00')) : NaN
   const retryAfter = Number.isFinite(failure.providerRetryAfterMs) && failure.providerRetryAfterMs > 0
@@ -167,39 +172,54 @@ export function accountCooldownDeadline(failure, now, fallbackMs) {
 }
 
 export function apply(ctx, config) {
-  /** 设置页保存过的值优先于插件配置，重启后从存档读回来。 */
-  const saved = loadSaved()
-  const override = {
-    enabled: typeof saved.enabled === 'boolean' ? saved.enabled : undefined,
-    perMinute: Number.isFinite(saved.perMinute) ? Math.min(60, Math.max(1, Math.round(saved.perMinute))) : undefined,
-    retryWaitMinutes: Number.isFinite(saved.retryWaitMinutes)
-      ? Math.min(60, Math.max(1, Math.round(saved.retryWaitMinutes)))
-      : undefined,
-  }
-
   const providerList = () => {
     const raw = String(readRaw(config && config.providers, 'tokenshare') ?? '')
     const list = raw.split(',').map((s) => s.trim().toLowerCase()).filter(Boolean)
     return list.length ? list : ['tokenshare']
   }
 
-  const live = () => ({
-    enabled: override.enabled !== undefined
-      ? override.enabled
-      : readBool(config && config.enabled, true),
-    perMinute: override.perMinute !== undefined
-      ? override.perMinute
-      : readNumber(config && config.perMinute, 14, 1, 60),
-    retryWaitMinutes: override.retryWaitMinutes !== undefined
-      ? override.retryWaitMinutes
-      : readNumber(config && config.retryWaitMinutes, 5, 1, 60),
-    windowSeconds: readNumber(config && config.windowSeconds, 60, 10, 600),
-    maxRetries: readNumber(config && config.maxRetries, 6, 0, 100),
-    maxImages: readNumber(config && config.maxImages, 4, 1, 50),
-  })
+  const live = () => {
+    const saved = loadSaved()
+    return {
+      enabled: readBool(typeof saved.enabled === 'boolean' ? saved.enabled : config?.enabled, true),
+      perMinute: readNumber(Number.isFinite(saved.perMinute) ? saved.perMinute : config?.perMinute, 14, 1, 60),
+      retryWaitMinutes: readNumber(Number.isFinite(saved.retryWaitMinutes) ? saved.retryWaitMinutes : config?.retryWaitMinutes, 5, 1, 60),
+      windowSeconds: readNumber(config?.windowSeconds, 60, 10, 600),
+      maxRetries: readNumber(config?.maxRetries, 6, 0, 100),
+      maxImages: readNumber(config?.maxImages, 4, 1, 50),
+    }
+  }
 
-  /** 本窗口内已放行的请求时间戳（升序）。 */
-  const stamps = []
+  // One conditional INSERT reserves a start across all hosts using this DSH home.
+  // The Nth most recent start still counts if the user lowers the limit mid-window.
+  let ledger
+  function requestLedger() {
+    if (ledger) return ledger
+    mkdirSync(COOLDOWN_DIR, { recursive: true, mode: 0o700 })
+    const db = new DatabaseSync(REQUEST_DB)
+    db.exec('PRAGMA busy_timeout = 2000; CREATE TABLE IF NOT EXISTS requests (at INTEGER PRIMARY KEY, seen INTEGER, owner INTEGER)')
+    // An upstream cannot receive a request after it has already answered it.
+    // Until the first chunk, keep the permit occupied even across a window rollover.
+    const nextStart = `max(
+      coalesce((SELECT at FROM requests ORDER BY at DESC LIMIT 1) + ?, 0),
+      coalesce((SELECT coalesce(seen, ?) AS stamp FROM requests ORDER BY stamp DESC LIMIT 1 OFFSET ?) + ?, 0)
+    )`
+    ledger = {
+      db,
+      claim: db.prepare('INSERT INTO requests(at, owner) SELECT ?, ? WHERE ? >= ' + nextStart),
+      next: db.prepare('SELECT ' + nextStart + ' AS at'),
+      acknowledge: db.prepare('UPDATE requests SET seen = ?, owner = NULL WHERE at = ?'),
+      count: db.prepare('SELECT count(*) AS used FROM requests WHERE seen IS NULL OR seen > ?'),
+      prune: db.prepare('DELETE FROM requests WHERE seen <= ?'),
+      pendingOwners: db.prepare('SELECT DISTINCT owner FROM requests WHERE seen IS NULL AND at <= ? AND owner != ?'),
+      retireOwner: db.prepare('UPDATE requests SET seen = ?, owner = NULL WHERE owner = ?'),
+    }
+    return ledger
+  }
+  ctx.effect(() => () => {
+    ledger?.db.close()
+    ledger = undefined
+  }, 'TokenShare request history')
   const stats = {
     total: 0,
     rateWaits: 0,
@@ -319,6 +339,7 @@ export function apply(ctx, config) {
     const { maxRetries } = live()
     for (let attempt = 0; ; attempt++) {
       const line = lines.get(route)
+      let reservedAt
       let wake
       const turn = new Promise(resolve => { wake = resolve })
       line.push(wake)
@@ -340,15 +361,25 @@ export function apply(ctx, config) {
           }
           const cfg = live()
           const windowMs = cfg.windowSeconds * 1000
-          while (stamps.length && now - stamps[0] >= windowMs) stamps.shift()
-          if (stamps.length < cfg.perMinute) {
-            stamps.push(now)
+          const spacing = Math.ceil(windowMs / cfg.perMinute)
+          const journal = requestLedger()
+          if (journal.claim.run(now, process.pid, now, spacing, now, cfg.perMinute - 1, windowMs).changes) {
+            reservedAt = now
+            journal.prune.run(now - 600_000) // Longest configurable window, including changes made while running.
             stats.total++
             break
           }
-          const opens = stamps[0] + windowMs + 250
+          // A host killed before its first response cannot release its permit.
+          // Start a full window from discovery so a recently sent request still counts.
+          for (const { owner } of journal.pendingOwners.all(now - windowMs, process.pid)) {
+            try { process.kill(owner, 0) } catch (error) {
+              if (error.code === 'ESRCH') journal.retireOwner.run(now, owner)
+              else if (error.code !== 'EPERM') throw error
+            }
+          }
+          const opens = journal.next.get(spacing, now, cfg.perMinute - 1, windowMs).at
           stats.rateWaits++
-          note(`达到每分钟 ${cfg.perMinute} 次上限，排队等待 ${((opens - now) / 1000).toFixed(1)} 秒`, 'warn')
+          note(`按 ${cfg.windowSeconds} 秒 ${cfg.perMinute} 次匀速发送，排队等待 ${((opens - now) / 1000).toFixed(1)} 秒`, 'info')
           await wait('rate', opens, signal)
         }
       } finally {
@@ -378,6 +409,10 @@ export function apply(ctx, config) {
             deadline = observeAccountFailure(route, chunk.reason.failure)
             break
           }
+          if (reservedAt !== undefined) {
+            requestLedger().acknowledge.run(Date.now(), reservedAt)
+            reservedAt = undefined
+          }
           if (!produced && chunk.type === 'usage' && Object.values(chunk.usage).every(n => n === 0)) {
             zeroUsage = chunk
             continue
@@ -389,6 +424,8 @@ export function apply(ctx, config) {
       } catch (error) {
         thrown = error
         if (!deadline) deadline = observeAccountFailure(route, error?.failure ?? error ?? {})
+      } finally {
+        if (reservedAt !== undefined) requestLedger().acknowledge.run(Date.now(), reservedAt)
       }
 
       if (!failureChunk && !thrown) {
@@ -418,7 +455,12 @@ export function apply(ctx, config) {
   ctx.on('llm/stream', function (options, next) {
     if (replays.delete(options)) return next()
     const route = matchesProvider(options.provider)
-    if (!route || !live().enabled) return next()
+    if (!route) return next()
+    if (!live().enabled) {
+      const now = Date.now()
+      refreshCooldowns(now)
+      if (!(cooldowns.get(route) > now)) return next()
+    }
     return limitedStream(this, options, next, route)
   })
   note('已监听 llm/stream')
@@ -428,7 +470,7 @@ export function apply(ctx, config) {
     const windowMs = cfg.windowSeconds * 1000
     const now = Date.now()
     refreshCooldowns(now)
-    while (stamps.length && now - stamps[0] >= windowMs) stamps.shift()
+    const used = existsSync(REQUEST_DB) ? requestLedger().count.get(now - windowMs).used : 0
     const active = [...cooldowns].filter(([, until]) => until > now).sort((a, b) => a[1] - b[1])
     const first = active.length
       ? { kind: 'account', route: active[0][0], until: active[0][1] }
@@ -445,7 +487,7 @@ export function apply(ctx, config) {
         maxImages: cfg.maxImages,
         providers: currentProviders,
       },
-      window: { used: stamps.length, limit: cfg.perMinute, windowSeconds: cfg.windowSeconds },
+      window: { used, limit: cfg.perMinute, windowSeconds: cfg.windowSeconds, spacingMs: Math.ceil(windowMs / cfg.perMinute) },
       waiting,
       queued: [...lines.values()].reduce((count, line) => count + line.length, 0),
       stats: {
@@ -468,9 +510,6 @@ export function apply(ctx, config) {
     if (patch.perMinute !== undefined) next.perMinute = readNumber(patch.perMinute, 14, 1, 60)
     if (patch.retryWaitMinutes !== undefined) next.retryWaitMinutes = readNumber(patch.retryWaitMinutes, 5, 1, 60)
     saveSaved({ ...loadSaved(), ...next })
-    if (next.enabled !== undefined) override.enabled = next.enabled
-    if (next.perMinute !== undefined) override.perMinute = next.perMinute
-    if (next.retryWaitMinutes !== undefined) override.retryWaitMinutes = next.retryWaitMinutes
     const cfg = live()
     note(`设置已更新：每分钟 ${cfg.perMinute} 次，异常等待 ${cfg.retryWaitMinutes} 分钟${cfg.enabled ? '' : '（已暂停）'}`)
     return snapshot()
@@ -538,9 +577,9 @@ export function apply(ctx, config) {
             return
           }
           if (req.method === 'POST' && path === '/reset') {
-            stamps.length = 0
-            note('手动清空当前窗口计数')
-            reply(res, 200, snapshot())
+            const state = snapshot()
+            if (state.window.used) reply(res, 409, { ok: false, error: '已发出的请求会在窗口到期后自动释放。' })
+            else reply(res, 200, state)
             return
           }
           reply(res, 404, { ok: false, error: '未知接口' })

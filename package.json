@@ -1,11 +1,12 @@
 {
   "name": "dsh-tokenshare-limiter",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "TokenShare 请求节流、异常重放与单提示词图片上限恢复；保留原始附件并复用 DSH 图片转存。",
   "type": "module",
   "main": "index.js",
   "license": "MIT",
   "engines": {
+    "node": ">=22.13.0",
     "dsh": ">=0.2.0"
   },
   "keywords": [
